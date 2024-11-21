@@ -1,0 +1,159 @@
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    Input, Embedding, Dense, Dropout, LayerNormalization, MultiHeadAttention, Layer
+)
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, TensorBoard
+from sklearn.model_selection import train_test_split
+import datetime
+import random
+import matplotlib.pyplot as plt
+import pickle
+import re
+import tkinter as tk
+from tkinter import scrolledtext, messagebox
+import os
+import torch
+from transformers import AutoModel, AutoTokenizer
+from Bio.Seq import Seq
+from Bio.SeqUtils import CodonAdaptationIndex
+import warnings
+warnings.filterwarnings('ignore')
+
+tf.config.run_functions_eagerly(True)
+print(f"Eager execution enabled: {tf.executing_eagerly()}")
+print(f"TensorFlow version: {tf.__version__}")
+
+def load_data(excel_path, sheet_name=0, max_rows=None):
+    try:
+        df = pd.read_excel(excel_path, sheet_name=sheet_name)
+        print(f"Columns in the Excel file: {df.columns.tolist()}")
+        print(df.head())
+        if 'Sequence' not in df.columns:
+            raise ValueError("Excel file must contain a 'Sequence' column.")
+        df = df[['Sequence']].dropna()
+        if max_rows:
+            df = df.head(max_rows)
+        df.reset_index(drop=True, inplace=True)
+        print(f"Loaded {len(df)} sequences from the Excel file.")
+        df['Protein'] = df['Sequence'].apply(lambda x: str(Seq(x).translate(to_stop=True)))
+        return df
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        raise
+
+def add_space_to_sequence(sequence):
+    return ' '.join([sequence[i:i+3] for i in range(0, len(sequence), 3)])
+
+def preprocess_sequences(df, mutation_rate=0.05, min_codon_length=3):
+    df['Sequence_with_spaces'] = df['Sequence'].apply(add_space_to_sequence)
+    codon_sequences = [seq.split(' ') for seq in df['Sequence_with_spaces'].values]
+    tokenizer = tf.keras.preprocessing.text.Tokenizer(char_level=False, lower=False)
+    tokenizer.fit_on_texts(codon_sequences)
+    tokenized_sequences = tokenizer.texts_to_sequences(codon_sequences)
+    protein_sequences = df['Protein'].values
+    return tokenizer, tokenized_sequences, protein_sequences
+
+def filter_zero_length_sequences(tokenized_sequences, protein_sequences):
+    filtered_sequences = []
+    filtered_protein = []
+    for seq, prot_seq in zip(tokenized_sequences, protein_sequences):
+        if len(seq) > 0:
+            filtered_sequences.append(seq)
+            filtered_protein.append(prot_seq)
+    print(f"Filtered to {len(filtered_sequences)} sequences after removing zero-length sequences.")
+    return filtered_sequences, filtered_protein
+
+def determine_max_sequence_length(tokenized_sequences, percentile=95):
+    sequence_lengths = [len(seq) for seq in tokenized_sequences]
+    max_sequence_length = int(np.percentile(sequence_lengths, percentile))
+    print(f"Determined max_sequence_length as the {percentile}th percentile: {max_sequence_length}")
+    return max_sequence_length
+
+def pad_sequences_custom(tokenized_sequences, max_sequence_length):
+    return tf.keras.preprocessing.sequence.pad_sequences(
+        tokenized_sequences, maxlen=max_sequence_length, padding='post', truncating='post', dtype='int32')
+
+def create_model(vocab_size, max_sequence_length, protein_embedding_dim):
+    decoder_embed_dim = 128
+    num_heads = 4
+    ff_dim = 512
+    num_layers = 2
+    dropout_rate = 0.1
+    protein_inputs = Input(shape=(protein_embedding_dim,), name="protein_embeddings")
+    protein_projection = Dense(decoder_embed_dim, activation='relu', name='protein_projection')(protein_inputs)
+    repeated_protein_embeddings = tf.keras.layers.RepeatVector(max_sequence_length)(protein_projection)
+    decoder_inputs = Input(shape=(max_sequence_length,), name="decoder_inputs")
+    decoder_embedding = Embedding(input_dim=vocab_size, output_dim=decoder_embed_dim, mask_zero=True)(decoder_inputs)
+    positions = tf.range(start=0, limit=max_sequence_length, delta=1)
+    position_embeddings = Embedding(input_dim=max_sequence_length, output_dim=decoder_embed_dim)(positions)
+    x = decoder_embedding + position_embeddings + repeated_protein_embeddings
+    for _ in range(num_layers):
+        x = TransformerBlock(embed_dim=decoder_embed_dim, num_heads=num_heads, ff_dim=ff_dim, rate=dropout_rate)(x)
+    outputs = Dense(vocab_size, activation='softmax')(x)
+    model = Model(inputs=[protein_inputs, decoder_inputs], outputs=outputs)
+    optimizer = Adam(learning_rate=0.0005, clipnorm=1.0)
+    model.compile(optimizer=optimizer,
+                  loss='sparse_categorical_crossentropy',
+                  metrics=['sparse_categorical_accuracy'])
+    return model
+
+class TransformerBlock(tf.keras.layers.Layer):
+    def __init__(self, embed_dim=128, num_heads=4, ff_dim=512, rate=0.1, **kwargs):
+        super(TransformerBlock, self).__init__(**kwargs)
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.ff_dim = ff_dim
+        self.rate = rate
+        self.supports_masking = True
+        self.att = MultiHeadAttention(num_heads=self.num_heads, key_dim=self.embed_dim)
+        self.ffn = tf.keras.Sequential(
+            [Dense(self.ff_dim, activation='relu'), Dense(self.embed_dim)]
+        )
+        self.layernorm1 = LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = LayerNormalization(epsilon=1e-6)
+        self.dropout1 = Dropout(self.rate)
+        self.dropout2 = Dropout(self.rate)
+
+    def call(self, inputs, training=None, mask=None):
+        attn_output = self.att(inputs, inputs, inputs, training=training, attention_mask=mask)
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = self.layernorm1(inputs + attn_output)
+        ffn_output = self.ffn(out1)
+        ffn_output = self.dropout2(ffn_output, training=training)
+        return self.layernorm2(out1 + ffn_output)
+
+    def get_config(self):
+        config = super(TransformerBlock, self).get_config()
+        config.update({
+            'embed_dim': self.embed_dim,
+            'num_heads': self.num_heads,
+            'ff_dim': self.ff_dim,
+            'rate': self.rate,
+        })
+        return config
+
+def main():
+    # Define paths for required files
+    excel_path = r"data.xlsx"  # Path to your Excel file with protein sequences
+    tokenizer_path = "tokenizer.pkl"
+    model_path = "trained_model.keras"
+    
+    # Load data
+    df = load_data(excel_path)
+    tokenizer, tokenized_sequences, protein_sequences = preprocess_sequences(df)
+    tokenized_sequences, protein_sequences = filter_zero_length_sequences(tokenized_sequences, protein_sequences)
+    max_sequence_length = determine_max_sequence_length(tokenized_sequences)
+    padded_sequences = pad_sequences_custom(tokenized_sequences, max_sequence_length)
+    
+    # Create model
+    vocab_size = len(tokenizer.word_index) + 1
+    protein_embedding_dim = 128  # Adjust based on your data
+    model = create_model(vocab_size, max_sequence_length, protein_embedding_dim)
+    model.summary()
+
+if __name__ == "__main__":
+    main()
